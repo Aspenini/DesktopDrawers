@@ -54,8 +54,25 @@ impl IconList {
 
     /// Extract the icon for `path` and add it, returning its image index. On any
     /// failure returns [`fallback_index`](Self::fallback_index).
+    ///
+    /// `SHGetFileInfoW` on a `.lnk` often returns the generic file icon rather
+    /// than the target's, so for shortcuts we resolve the target and use its
+    /// icon (falling back to the `.lnk` itself, then the generic icon).
     pub fn add_for_path(&mut self, path: &Path) -> i32 {
-        match extract_icon(path) {
+        let is_lnk = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+
+        let icon = if is_lnk {
+            crate::shortcut::resolve_target(path)
+                .and_then(|target| extract_icon(&target))
+                .or_else(|| extract_icon(path))
+        } else {
+            extract_icon(path)
+        };
+
+        match icon {
             Some(icon) => {
                 let idx = unsafe { ImageList_ReplaceIcon(self.handle, -1, icon) };
                 unsafe {

@@ -3,6 +3,7 @@
 pub mod create_drawer;
 pub mod drawer;
 pub mod drawer_settings;
+pub mod drop_target;
 pub mod manager;
 
 use windows::Win32::Foundation::{HWND, WPARAM};

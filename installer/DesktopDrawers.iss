@@ -11,7 +11,7 @@
 ;   * does NOT create a startup entry, service, scheduled task, or tray icon
 
 #define AppName "DesktopDrawers"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppExe "DesktopDrawers.exe"
 #define AppPublisher "DesktopDrawers"
 

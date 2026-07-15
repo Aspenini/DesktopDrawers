@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::MAX_PATH;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
 };
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::UI::Shell::{
     IShellLinkW, SHGetKnownFolderPath, SHELLEXECUTEINFOW_0, ShellExecuteExW, ShellLink,
     FOLDERID_Desktop, KF_FLAG_DEFAULT, SHELLEXECUTEINFOW,
@@ -19,21 +19,21 @@ use windows::core::{Interface, PCWSTR, PWSTR};
 use crate::error::{Error, Result};
 use crate::win32::{from_wide, wide};
 
-/// RAII guard for a COM apartment. Initialize once per thread that touches the
-/// Shell APIs (the UI thread).
+/// RAII guard for the UI thread's OLE apartment. `OleInitialize` sets up an STA
+/// (like `CoInitializeEx(APARTMENTTHREADED)`) *and* the OLE services required by
+/// `RegisterDragDrop`, the Shell, and clipboard.
 pub struct ComApartment;
 
 impl ComApartment {
     pub fn init_sta() -> Result<ComApartment> {
-        // COINIT_APARTMENTTHREADED is required for Shell UI (drag-drop, menus).
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+        unsafe { OleInitialize(None)? };
         Ok(ComApartment)
     }
 }
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        unsafe { OleUninitialize() };
     }
 }
 

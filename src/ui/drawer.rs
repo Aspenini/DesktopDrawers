@@ -13,6 +13,7 @@ use windows::Win32::UI::Controls::{
     LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVM_SETEXTENDEDLISTVIEWSTYLE, NMHDR, NMITEMACTIVATE,
     NMLVDISPINFOW, NM_RCLICK,
 };
+use windows::Win32::System::Ole::{IDropTarget, RegisterDragDrop, RevokeDragDrop};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -30,6 +31,8 @@ struct DrawerState {
     icons: IconList,
     /// ListView row index -> item id.
     item_ids: Vec<Uuid>,
+    /// Kept alive while the drop target is registered on the ListView.
+    _drop_target: Option<IDropTarget>,
 }
 
 fn state<'a>(hwnd: HWND) -> Option<&'a mut DrawerState> {
@@ -111,6 +114,7 @@ pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     listview: HWND::default(),
                     icons: IconList::new(icon_px),
                     item_ids: Vec::new(),
+                    _drop_target: None,
                 });
                 set_userdata(hwnd, Box::into_raw(boxed));
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -118,6 +122,7 @@ pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_CREATE => {
                 if let Some(st) = state(hwnd) {
                     create_listview(hwnd, st);
+                    register_drop(hwnd, st);
                     populate(st);
                 }
                 LRESULT(0)
@@ -150,6 +155,9 @@ pub extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             WM_DESTROY => {
                 if let Some(st) = state(hwnd) {
+                    if !st.listview.0.is_null() {
+                        let _ = RevokeDragDrop(st.listview);
+                    }
                     save_position(hwnd);
                     let id = st.id;
                     (*st.app).on_drawer_closed(id);
@@ -207,6 +215,16 @@ fn create_listview(parent: HWND, st: &mut DrawerState) {
     }
     set_font(listview);
     st.listview = listview;
+}
+
+/// Register the ListView as an OLE drop target so Explorer/desktop drags land in
+/// this drawer. `owner` is the drawer window, whose state `add_paths` recovers.
+fn register_drop(owner: HWND, st: &mut DrawerState) {
+    let target = crate::ui::drop_target::DropTarget::create(owner);
+    let registered = unsafe { RegisterDragDrop(st.listview, &target) };
+    if registered.is_ok() {
+        st._drop_target = Some(target);
+    }
 }
 
 /// Rebuild every item, its icon, and its grid position.
@@ -660,15 +678,17 @@ fn arrange(hwnd: HWND, f: impl FnOnce(&mut crate::model::Drawer)) {
     populate(st);
 }
 
-/// Add a shortcut via the file picker (drag-drop from Explorer arrives here too
-/// once the drop target is wired up).
+/// Add one or more shortcuts via the multi-select file picker.
 fn add_shortcut(hwnd: HWND) {
-    let Some(path) = pick_file(hwnd) else { return };
-    add_path_to_drawer(hwnd, &path);
+    let paths = pick_files(hwnd);
+    if !paths.is_empty() {
+        add_paths(hwnd, &paths);
+    }
 }
 
-/// Copy/create a managed `.lnk` for `path` and add it to the drawer.
-pub fn add_path_to_drawer(hwnd: HWND, path: &std::path::Path) {
+/// Copy/create a managed `.lnk` for each path and add them to the drawer,
+/// rebuilding the view once. Shared by the file picker and Explorer drag-drop.
+pub fn add_paths(hwnd: HWND, paths: &[PathBuf]) {
     let Some(st) = state(hwnd) else { return };
     let id = st.id;
     let items_dir = unsafe { (*st.app).store.drawer_items_dir(id) };
@@ -676,6 +696,46 @@ pub fn add_path_to_drawer(hwnd: HWND, path: &std::path::Path) {
         return;
     }
 
+    let mut added = 0usize;
+    let mut failed = 0usize;
+    let mut full = false;
+
+    for path in paths {
+        let Some((rel, display, item_id, dest)) = make_managed_item(&items_dir, path) else {
+            failed += 1;
+            continue;
+        };
+        unsafe {
+            if let Some(d) = (*st.app).drawer_mut(id) {
+                if d.add_item(rel, display, item_id).is_err() {
+                    let _ = std::fs::remove_file(&dest);
+                    full = true;
+                    break;
+                }
+                added += 1;
+            }
+        }
+    }
+
+    if added > 0 {
+        unsafe {
+            let _ = (*st.app).save_drawer(id);
+        }
+        populate(st);
+    }
+    if full {
+        crate::ui::message_box(Some(hwnd), "The drawer is full — not everything fit.", "DesktopDrawers");
+    } else if failed > 0 {
+        crate::ui::message_box(Some(hwnd), "Some items could not be added.", "DesktopDrawers");
+    }
+}
+
+/// Turn a dropped/picked path into a managed `.lnk` in `items_dir`. Returns the
+/// relative shortcut path, display name, new item id, and the destination file.
+fn make_managed_item(
+    items_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<(String, String, Uuid, PathBuf)> {
     let item_id = Uuid::new_v4();
     let lnk_name = format!("{item_id}.lnk");
     let dest = items_dir.join(&lnk_name);
@@ -686,37 +746,27 @@ pub fn add_path_to_drawer(hwnd: HWND, path: &std::path::Path) {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Shortcut".into());
 
-    let is_lnk = path.extension().and_then(|s| s.to_str()).map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false);
+    let is_lnk = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
 
     let ok = if is_lnk {
         std::fs::copy(path, &dest).is_ok()
     } else {
-        let workdir = path.parent();
-        crate::shortcut::create_lnk(&dest, path, None, workdir, Some(&display), None).is_ok()
+        crate::shortcut::create_lnk(&dest, path, None, path.parent(), Some(&display), None).is_ok()
     };
-    if !ok {
-        crate::ui::message_box(Some(hwnd), "Could not add that shortcut.", "DesktopDrawers");
-        return;
-    }
-
-    unsafe {
-        if let Some(d) = (*st.app).drawer_mut(id) {
-            if d.add_item(rel, display, item_id).is_err() {
-                crate::ui::message_box(Some(hwnd), "This drawer is full.", "DesktopDrawers");
-                let _ = std::fs::remove_file(&dest);
-                return;
-            }
-            let _ = (*st.app).save_drawer(id);
-        }
-    }
-    populate(st);
+    ok.then_some((rel, display, item_id, dest))
 }
 
-fn pick_file(hwnd: HWND) -> Option<PathBuf> {
+/// Multi-select file picker. Returns every chosen path (empty if cancelled).
+fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
     use windows::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OPENFILENAMEW,
+        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+        OPENFILENAMEW,
     };
-    let mut buf = [0u16; 1024];
+    // Large buffer: multi-select returns dir + every filename packed together.
+    let mut buf = vec![0u16; 16384];
     let filter: Vec<u16> = "All Files\0*.*\0Shortcuts\0*.lnk;*.url\0Programs\0*.exe\0\0"
         .encode_utf16()
         .collect();
@@ -726,14 +776,39 @@ fn pick_file(hwnd: HWND) -> Option<PathBuf> {
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: windows::core::PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
-        Flags: OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+        Flags: OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
         ..Default::default()
     };
-    let ok = unsafe { GetOpenFileNameW(&mut ofn).as_bool() };
-    if ok {
-        Some(PathBuf::from(from_wide(&buf)))
+    if unsafe { GetOpenFileNameW(&mut ofn).as_bool() } {
+        parse_multi_select(&buf)
     } else {
-        None
+        Vec::new()
+    }
+}
+
+/// Parse the `OFN_ALLOWMULTISELECT` result buffer.
+///
+/// One selection: a single NUL-terminated full path. Multiple: the directory,
+/// then each filename, each NUL-terminated, ending in a double NUL.
+fn parse_multi_select(buf: &[u16]) -> Vec<PathBuf> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    for (i, &c) in buf.iter().enumerate() {
+        if c == 0 {
+            if i == start {
+                break; // empty string => terminator
+            }
+            parts.push(String::from_utf16_lossy(&buf[start..i]));
+            start = i + 1;
+        }
+    }
+    match parts.len() {
+        0 => Vec::new(),
+        1 => vec![PathBuf::from(&parts[0])],
+        _ => {
+            let dir = PathBuf::from(&parts[0]);
+            parts[1..].iter().map(|f| dir.join(f)).collect()
+        }
     }
 }
 
